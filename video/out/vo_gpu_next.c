@@ -154,6 +154,7 @@ struct priv {
     bool flush_cache;
     bool frame_pending;
     bool paused;
+    bool motion_warned;
 
     pl_options pars;
     struct m_config_cache *opts_cache;
@@ -2876,6 +2877,13 @@ static void update_render_options(struct vo *vo)
     pars->params.downscaler = map_scaler(p, SCALER_DSCALE);
     pars->params.plane_upscaler = map_scaler(p, SCALER_CSCALE);
     pars->params.frame_mixer = opts->interpolation ? map_scaler(p, SCALER_TSCALE) : NULL;
+    if (pars->params.frame_mixer && !p->motion_warned &&
+        opts->interpolation_mode == INTERPOLATION_MOTION)
+    {
+        MP_WARN(vo, "--interpolation-mode=motion requires --vo=gpu, "
+                    "using --tscale instead.\n");
+        p->motion_warned = true;
+    }
 
     // Request as many frames as required from the decoder, depending on the
     // speed VPS/FPS ratio libplacebo may need more frames. Request frames up to
