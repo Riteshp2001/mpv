@@ -124,6 +124,20 @@ struct surface {
 
 #define SURFACES_MAX 10
 
+// Luma pyramid levels searched by --interpolation-mode=motion, finest first.
+#define MOTION_LEVELS 4
+// Luma texels covered by each motion vector.
+#define MOTION_BLOCK 4
+// Exhaustive search radius in texels on the coarsest level.
+#define MOTION_RANGE 4
+// The finest level is downscaled until it has at most this many texels.
+#define MOTION_MAX_AREA (640 * 384)
+
+struct motion_frame {
+    uint64_t id; // surface the pyramid was built from, 0 if invalid
+    struct ra_tex *luma[MOTION_LEVELS];
+};
+
 struct cached_file {
     char *path;
     struct bstr body;
@@ -210,6 +224,15 @@ struct gl_video {
 
     struct ra_buf *hdr_peak_ssbo;
     struct surface surfaces[SURFACES_MAX];
+
+    // --interpolation-mode=motion state, index 0 is the forward direction
+    struct motion_frame motion_frames[2];
+    struct ra_tex *motion_vectors[2][MOTION_LEVELS];
+    struct ra_tex *motion_refined[2];
+    struct ra_tex *motion_fields[2];
+    struct ra_tex *motion_scene;
+    uint64_t motion_pair[2]; // surface IDs motion_fields were estimated for
+    bool motion_disabled;    // a motion shader failed, blend instead
 
     // user pass descriptions and textures
     struct tex_hook *tex_hooks;
@@ -540,6 +563,9 @@ const struct m_sub_options gl_video_conf = {
         {"background-tile-size", OPT_INT(background_tile_size), M_RANGE(1, 4096)},
         {"interpolation", OPT_BOOL(interpolation)},
         {"interpolation-threshold", OPT_FLOAT(interpolation_threshold)},
+        {"interpolation-mode", OPT_CHOICE(interpolation_mode,
+            {"blend", INTERPOLATION_BLEND},
+            {"motion", INTERPOLATION_MOTION})},
         {"blend-subtitles", OPT_CHOICE(blend_subs,
             {"no", BLEND_SUBS_NO},
             {"yes", BLEND_SUBS_YES},
@@ -621,6 +647,10 @@ static void gl_video_reset_surfaces(struct gl_video *p)
     p->surface_now = 0;
     p->frames_drawn = 0;
     p->output_tex_valid = false;
+    for (int i = 0; i < 2; i++) {
+        p->motion_frames[i].id = 0;
+        p->motion_pair[i] = 0;
+    }
 }
 
 static void gl_video_reset_hooks(struct gl_video *p)
@@ -673,6 +703,17 @@ static void uninit_rendering(struct gl_video *p)
 
     for (int n = 0; n < SURFACES_MAX; n++)
         ra_tex_free(p->ra, &p->surfaces[n].tex);
+
+    for (int n = 0; n < 2; n++) {
+        for (int i = 0; i < MOTION_LEVELS; i++) {
+            ra_tex_free(p->ra, &p->motion_frames[n].luma[i]);
+            ra_tex_free(p->ra, &p->motion_vectors[n][i]);
+        }
+        ra_tex_free(p->ra, &p->motion_refined[n]);
+        ra_tex_free(p->ra, &p->motion_fields[n]);
+    }
+    ra_tex_free(p->ra, &p->motion_scene);
+    p->motion_disabled = false;
 
     for (int n = 0; n < p->num_hook_textures; n++)
         ra_tex_free(p->ra, &p->hook_textures[n]);
@@ -3367,6 +3408,326 @@ static bool update_surface(struct gl_video *p, struct mp_image *mpi,
     return true;
 }
 
+// Motion-compensated interpolation (--interpolation-mode=motion). Forward
+// (A->B) and backward (B->A) block motion is estimated hierarchically on a luma
+// pyramid once per frame pair. Every vsync then warps both frames to the
+// requested phase and merges the two predictions, blending where tracking
+// fails. Vectors are stored in normalized texture coordinates.
+
+static void motion_level_sizes(int w, int h, int *factor,
+                               int lw[MOTION_LEVELS], int lh[MOTION_LEVELS])
+{
+    int f = 1;
+    while (f < 16 && (int64_t)(w / f) * (h / f) > MOTION_MAX_AREA)
+        f *= 2;
+    *factor = f;
+    lw[0] = (w + f - 1) / f;
+    lh[0] = (h + f - 1) / f;
+    for (int n = 1; n < MOTION_LEVELS; n++) {
+        lw[n] = (lw[n - 1] + 1) / 2;
+        lh[n] = (lh[n - 1] + 1) / 2;
+    }
+}
+
+static int motion_bind(struct gl_video *p, struct ra_tex *tex)
+{
+    return pass_bind(p, image_wrap(tex, PLANE_RGB, 4));
+}
+
+// Builds the perceptual luma pyramid that blocks of a surface are matched on.
+static bool motion_build_frame(struct gl_video *p, struct motion_frame *f,
+                               struct surface *surf, int factor,
+                               const int lw[MOTION_LEVELS],
+                               const int lh[MOTION_LEVELS])
+{
+    f->id = 0;
+
+    // Box filter by `factor`, each bilinear tap averaging 2x2 texels.
+    int taps = MPMAX(factor / 2, 1);
+    pass_describe(p, "motion luma");
+    motion_bind(p, surf->tex);
+    GLSL(vec3 rgb = vec3(0.0);)
+    GLSLF("for (int y = 0; y < %d; y++) {\n", taps);
+    GLSLF("for (int x = 0; x < %d; x++) {\n", taps);
+    GLSLF("vec2 o = (vec2(float(x), float(y)) - %f) * %f;\n",
+          (taps - 1) / 2.0, factor > 1 ? 2.0 : 0.0);
+    GLSL(rgb += texture(texture0, texcoord0 + o * pixel_size0).rgb;)
+    GLSLF("}}\n");
+    GLSLF("float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722)) * %f;\n",
+          1.0 / (taps * taps));
+    GLSL(color = vec4(sqrt(max(luma, 0.0)), 0.0, 0.0, 1.0);)
+    finish_pass_tex(p, &f->luma[0], lw[0], lh[0]);
+    if (!f->luma[0])
+        return false;
+
+    for (int n = 1; n < MOTION_LEVELS; n++) {
+        pass_describe(p, "motion luma");
+        motion_bind(p, f->luma[n - 1]);
+        GLSL(color = vec4(texture(texture0, texcoord0).r, 0.0, 0.0, 1.0);)
+        finish_pass_tex(p, &f->luma[n], lw[n], lh[n]);
+        if (!f->luma[n])
+            return false;
+    }
+
+    f->id = surf->id;
+    return true;
+}
+
+// Adds block matching helpers for a pass that renders one vector per texel.
+// texture0 is the luma the vectors start from, texture1 the luma they point
+// into. The cost is the mean absolute difference over a 6x6 texel window.
+static void motion_add_matcher(struct gl_video *p)
+{
+    GLSLHF("float motion_ref[36];\n");
+    GLSLHF("float motion_cost(vec2 c, vec2 v) {\n"
+           "    float s = 0.0;\n"
+           "    for (int i = 0; i < 36; i++) {\n"
+           "        vec2 o = vec2(float(i - (i / 6) * 6), float(i / 6)) - 2.5;\n"
+           "        s += abs(motion_ref[i] - texture(texture1, c + v + o * pixel_size1).r);\n"
+           "    }\n"
+           "    return s * (1.0 / 36.0);\n"
+           "}\n");
+    GLSLHF("void motion_try(vec2 c, vec2 v, float pen, inout vec2 best,\n"
+           "                inout float cost) {\n"
+           "    float k = motion_cost(c, v) + pen;\n"
+           "    if (k < cost) {\n"
+           "        cost = k;\n"
+           "        best = v;\n"
+           "    }\n"
+           "}\n");
+    GLSL(vec2 c = texcoord0;)
+    GLSLF("for (int i = 0; i < 36; i++) {\n"
+          "    vec2 o = vec2(float(i - (i / 6) * 6), float(i / 6)) - 2.5;\n"
+          "    motion_ref[i] = texture(texture0, c + o * pixel_size0).r;\n"
+          "}\n");
+}
+
+// Estimates one pyramid level of motion in direction `dir`, seeded from the
+// coarser level and from the previous frame pair. Stores the cost in .z.
+static bool motion_search(struct gl_video *p, struct motion_frame *from,
+                          struct motion_frame *to, int dir, int level,
+                          int vw, int vh, bool use_prev)
+{
+    static const double steps[] = {1.0, 0.5, 0.25};
+    bool coarsest = level == MOTION_LEVELS - 1;
+
+    pass_describe(p, "motion search");
+    motion_bind(p, from->luma[level]);
+    motion_bind(p, to->luma[level]);
+    int seed = coarsest ? -1 : motion_bind(p, p->motion_vectors[dir][level + 1]);
+    int prev = use_prev ? motion_bind(p, p->motion_fields[dir]) : -1;
+    motion_add_matcher(p);
+    GLSL(vec2 best = vec2(0.0);)
+    GLSL(float cost = motion_cost(c, best);)
+    if (coarsest) {
+        // Exhaustive search, slightly preferring short vectors on flat areas.
+        GLSLF("for (int y = -%d; y <= %d; y++) {\n", MOTION_RANGE, MOTION_RANGE);
+        GLSLF("for (int x = -%d; x <= %d; x++) {\n", MOTION_RANGE, MOTION_RANGE);
+        GLSL(vec2 d = vec2(float(x), float(y));)
+        GLSL(motion_try(c, d * pixel_size0, 0.0005 * length(d), best, cost);)
+        GLSLF("}}\n");
+    } else {
+        // Seed with the coarser vectors of this block and its neighbours.
+        static const char *const offsets[] = {
+            "0.0, 0.0", "sp.x, 0.0", "-sp.x, 0.0", "0.0, sp.y", "0.0, -sp.y",
+        };
+        GLSLF("vec2 sp = pixel_size%d;\n", seed);
+        for (int n = 0; n < MP_ARRAY_SIZE(offsets); n++) {
+            GLSLF("motion_try(c, texture(texture%d, c + vec2(%s)).xy, 0.0, "
+                  "best, cost);\n", seed, offsets[n]);
+        }
+    }
+    if (prev >= 0)
+        GLSLF("motion_try(c, texture(texture%d, c).xy, 0.001, best, cost);\n", prev);
+
+    int first = coarsest ? 1 : 0, last = level ? 2 : 3;
+    for (int n = first; n < last; n++) {
+        GLSLF("{\n"
+              "vec2 seed = best;\n"
+              "for (int y = -1; y <= 1; y++) {\n"
+              "for (int x = -1; x <= 1; x++) {\n"
+              "    vec2 d = vec2(float(x), float(y)) * %f;\n"
+              "    if (x != 0 || y != 0)\n"
+              "        motion_try(c, seed + d * pixel_size0, 0.0005, best, cost);\n"
+              "}}\n"
+              "}\n", steps[n]);
+    }
+    GLSL(color = vec4(best, cost, 1.0);)
+    finish_pass_tex(p, &p->motion_vectors[dir][level], vw, vh);
+    return p->motion_vectors[dir][level];
+}
+
+// Re-evaluates the neighbouring vectors of each block to remove outliers and
+// to align the field with object boundaries.
+static bool motion_refine(struct gl_video *p, struct motion_frame *from,
+                          struct motion_frame *to, int dir, int vw, int vh)
+{
+    pass_describe(p, "motion refine");
+    motion_bind(p, from->luma[0]);
+    motion_bind(p, to->luma[0]);
+    motion_bind(p, p->motion_vectors[dir][0]);
+    motion_add_matcher(p);
+    GLSL(vec2 best = texture(texture2, c).xy;)
+    GLSL(float cost = motion_cost(c, best);)
+    GLSLF("for (int y = -1; y <= 1; y++) {\n"
+          "for (int x = -1; x <= 1; x++) {\n"
+          "    vec2 v = texture(texture2, c + vec2(float(x), float(y)) * pixel_size2).xy;\n"
+          "    if (x != 0 || y != 0)\n"
+          "        motion_try(c, v, 0.0005, best, cost);\n"
+          "}}\n");
+    GLSL(color = vec4(best, cost, 1.0);)
+    finish_pass_tex(p, &p->motion_refined[dir], vw, vh);
+    return p->motion_refined[dir];
+}
+
+// Stores in .w how far each vector is from inverting the opposite field, in
+// texels of the finest search level. Large values indicate occlusions.
+static bool motion_check(struct gl_video *p, int dir, int vw, int vh,
+                         int lw, int lh)
+{
+    pass_describe(p, "motion check");
+    motion_bind(p, p->motion_refined[dir]);
+    motion_bind(p, p->motion_refined[!dir]);
+    gl_sc_uniform_vec2(p->sc, "motion_size", (float[2]){lw, lh});
+    GLSL(vec4 v = texture(texture0, texcoord0);)
+    GLSL(vec2 w = texture(texture1, texcoord0 + v.xy).xy;)
+    GLSL(color = vec4(v.xyz, length((v.xy + w) * motion_size));)
+    finish_pass_tex(p, &p->motion_fields[dir], vw, vh);
+    return p->motion_fields[dir];
+}
+
+// Writes the share of sampled blocks without a match in either direction to a
+// 1x1 texture, so the output pass can skip interpolating across scene cuts.
+static bool motion_detect_scene(struct gl_video *p)
+{
+    pass_describe(p, "motion scene");
+    motion_bind(p, p->motion_fields[0]);
+    motion_bind(p, p->motion_fields[1]);
+    GLSL(float bad = 0.0;)
+    GLSLF("for (int y = 0; y < 8; y++) {\n"
+          "for (int x = 0; x < 8; x++) {\n"
+          "    vec2 q = (vec2(float(x), float(y)) + 0.5) * 0.125;\n"
+          "    bad += step(0.08, texture(texture0, q).z) +\n"
+          "           step(0.08, texture(texture1, q).z);\n"
+          "}}\n");
+    GLSL(color = vec4(bad * (1.0 / 128.0), 0.0, 0.0, 1.0);)
+    finish_pass_tex(p, &p->motion_scene, 1, 1);
+    return p->motion_scene;
+}
+
+// Estimates the motion between surfaces a and b, unless already done.
+static bool motion_estimate(struct gl_video *p, struct surface *a,
+                            struct surface *b)
+{
+    if (p->motion_pair[0] == a->id && p->motion_pair[1] == b->id)
+        return true;
+
+    int factor, lw[MOTION_LEVELS], lh[MOTION_LEVELS];
+    motion_level_sizes(a->tex->params.w, a->tex->params.h, &factor, lw, lh);
+
+    // The previous pair's vectors predict motion continuing through a.
+    bool use_prev = p->motion_pair[1] && p->motion_pair[1] == a->id;
+    p->motion_pair[0] = p->motion_pair[1] = 0;
+
+    // Reuse the pyramid of the frame shared with the previous pair.
+    struct surface *surfs[2] = {a, b};
+    struct motion_frame *frames[2] = {0};
+    for (int i = 0; i < 2; i++) {
+        for (int n = 0; n < 2; n++) {
+            if (p->motion_frames[n].id == surfs[i]->id)
+                frames[i] = &p->motion_frames[n];
+        }
+    }
+    for (int i = 0; i < 2; i++) {
+        if (frames[i])
+            continue;
+        frames[i] = &p->motion_frames[frames[!i] == &p->motion_frames[0]];
+        if (!motion_build_frame(p, frames[i], surfs[i], factor, lw, lh))
+            return false;
+    }
+
+    for (int level = MOTION_LEVELS - 1; level >= 0; level--) {
+        int vw = (lw[level] + MOTION_BLOCK - 1) / MOTION_BLOCK,
+            vh = (lh[level] + MOTION_BLOCK - 1) / MOTION_BLOCK;
+        for (int dir = 0; dir < 2; dir++) {
+            if (!motion_search(p, frames[dir], frames[!dir], dir, level,
+                               vw, vh, use_prev))
+                return false;
+        }
+    }
+
+    int fw = (lw[0] + MOTION_BLOCK - 1) / MOTION_BLOCK,
+        fh = (lh[0] + MOTION_BLOCK - 1) / MOTION_BLOCK;
+    for (int dir = 0; dir < 2; dir++) {
+        if (!motion_refine(p, frames[dir], frames[!dir], dir, fw, fh))
+            return false;
+    }
+    for (int dir = 0; dir < 2; dir++) {
+        if (!motion_check(p, dir, fw, fh, lw[0], lh[0]))
+            return false;
+    }
+    if (!motion_detect_scene(p))
+        return false;
+
+    p->motion_pair[0] = a->id;
+    p->motion_pair[1] = b->id;
+    return true;
+}
+
+// Warps texture0 (A) and texture1 (B) to phase t with the vector fields bound
+// as texture2 (forward) and texture3 (backward), and the scene flag texture4.
+static void motion_render(struct gl_video *p, double t)
+{
+    gl_sc_uniform_dynamic(p->sc);
+    gl_sc_uniform_f(p->sc, "motion_t", t);
+    GLSLHF("bool motion_inside(vec2 q) {\n"
+           "    return all(greaterThanEqual(q, vec2(0.0))) &&\n"
+           "           all(lessThanEqual(q, vec2(1.0)));\n"
+           "}\n");
+    GLSLHF("float motion_match(vec4 x, vec4 y) {\n"
+           "    vec3 k = vec3(0.2126, 0.7152, 0.0722);\n"
+           "    float d = sqrt(max(dot(x.rgb, k), 0.0)) - sqrt(max(dot(y.rgb, k), 0.0));\n"
+           "    return exp(-256.0 * d * d);\n"
+           "}\n");
+    GLSLF("{\n"
+          "vec2 pos = texcoord0;\n"
+          "float t = motion_t;\n"
+          "vec4 vf = texture(texture2, pos);\n"
+          "vf = texture(texture2, pos - t * vf.xy);\n"
+          "vec4 vb = texture(texture3, pos);\n"
+          "vb = texture(texture3, pos - (1.0 - t) * vb.xy);\n"
+          "vec2 af = pos - t * vf.xy;\n"
+          "vec2 bf = pos + (1.0 - t) * vf.xy;\n"
+          "vec2 bb = pos - (1.0 - t) * vb.xy;\n"
+          "vec2 ab = pos + t * vb.xy;\n"
+          "vec4 caf = texture(texture0, af);\n"
+          "vec4 cbf = texture(texture1, bf);\n"
+          "vec4 cab = texture(texture0, ab);\n"
+          "vec4 cbb = texture(texture1, bb);\n"
+          // Average a prediction's two samples only where they agree, else
+          // keep the frame its vector was measured in.
+          "float gf = motion_inside(bf) ? motion_match(caf, cbf) : 0.0;\n"
+          "float gb = motion_inside(ab) ? motion_match(cab, cbb) : 0.0;\n"
+          "vec4 pf = motion_inside(af) ? mix(caf, mix(caf, cbf, t), gf) : cbf;\n"
+          "vec4 pb = motion_inside(bb) ? mix(cbb, mix(cab, cbb, t), gb) : cab;\n"
+          // Weight by match quality and by distance from the source frame,
+          // so the output converges to A and B at the ends of the interval.
+          "float rf = exp(-30.0 * max(vf.z - 0.02, 0.0));\n"
+          "float rb = exp(-30.0 * max(vb.z - 0.02, 0.0));\n"
+          "float wf = rf * (1.0 - t) + 0.001;\n"
+          "float wb = rb * t + 0.001;\n"
+          "vec4 res = (pf * wf + pb * wb) / (wf + wb);\n"
+          // Blend where neither direction matched or stayed consistent.
+          "float conf = smoothstep(0.1, 0.5, max(rf, rb)) *\n"
+          "             (1.0 - smoothstep(2.0, 6.0, min(vf.w, vb.w)));\n"
+          "if (conf < 1.0)\n"
+          "    res = mix(mix(texture(texture0, pos), texture(texture1, pos), t), res, conf);\n"
+          "if (texture(texture4, vec2(0.5)).r > 0.6)\n"
+          "    res = t < 0.5 ? texture(texture0, pos) : texture(texture1, pos);\n"
+          "color = res;\n"
+          "}\n");
+}
+
 // Draws an interpolate frame to fbo, based on the frame timing in t
 // flags: bit set of RENDER_FRAME_* flags
 static void gl_video_interpolate_frame(struct gl_video *p, struct vo_frame *t,
@@ -3408,8 +3769,12 @@ static void gl_video_interpolate_frame(struct gl_video *p, struct vo_frame *t,
     // surface_end.
     struct scaler *tscale = &p->scaler[SCALER_TSCALE];
     reinit_scaler(p, tscale, &p->opts.scaler[SCALER_TSCALE], 1, tscale_sizes);
-    bool oversample = tscale->conf.kernel.function == SCALER_OVERSAMPLE;
-    bool linear = tscale->conf.kernel.function == SCALER_LINEAR;
+    // Motion interpolation mixes two frames, and blends them if it fails.
+    bool motion_mode = p->opts.interpolation_mode == INTERPOLATION_MOTION;
+    bool oversample = !motion_mode &&
+                      tscale->conf.kernel.function == SCALER_OVERSAMPLE;
+    bool linear = motion_mode ||
+                  tscale->conf.kernel.function == SCALER_LINEAR;
     int size;
 
     if (oversample || linear) {
@@ -3472,9 +3837,11 @@ static void gl_video_interpolate_frame(struct gl_video *p, struct vo_frame *t,
     // Finally, draw the right mix of frames to the screen.
     if (!is_new)
         pass_info_reset(p, true);
-    pass_describe(p, "interpolation");
+    bool had_error = gl_sc_error_state(p->sc);
+    bool motion_tried = false, motion = false;
     if (!valid || t->still) {
         // surface_now is guaranteed to be valid, so we can safely use it.
+        pass_describe(p, "interpolation");
         pass_read_tex(p, p->surfaces[surface_now].tex);
         p->is_interpolated = false;
     } else {
@@ -3495,6 +3862,15 @@ static void gl_video_interpolate_frame(struct gl_video *p, struct vo_frame *t,
             }
         }
 
+        // Motion is estimated in separate passes before the output pass.
+        if (motion_mode && !p->motion_disabled) {
+            motion_tried = true;
+            motion = motion_estimate(p, &p->surfaces[surface_bse],
+                            &p->surfaces[surface_wrap(surface_bse + 1)]) &&
+                     !gl_sc_error_state(p->sc);
+        }
+        pass_describe(p, "interpolation%s", motion ? " (motion)" : "");
+
         if (oversample) {
             // Oversample uses the frame area as mix ratio, not the vsync
             // position itself
@@ -3508,7 +3884,9 @@ static void gl_video_interpolate_frame(struct gl_video *p, struct vo_frame *t,
         }
 
         // Blend the frames together
-        if (oversample || linear) {
+        if (motion) {
+            motion_render(p, mix);
+        } else if (oversample || linear) {
             gl_sc_uniform_dynamic(p->sc);
             gl_sc_uniform_f(p->sc, "inter_coeff", mix);
             GLSL(color = mix(texture(texture0, texcoord0),
@@ -3531,12 +3909,25 @@ static void gl_video_interpolate_frame(struct gl_video *p, struct vo_frame *t,
             int id = pass_bind(p, img);
             mp_assert(id == i);
         }
+        if (motion) {
+            motion_bind(p, p->motion_fields[0]);
+            motion_bind(p, p->motion_fields[1]);
+            motion_bind(p, p->motion_scene);
+        }
 
         MP_TRACE(p, "inter frame dur: %f vsync: %f, mix: %f\n",
                  t->ideal_frame_duration, t->vsync_interval, mix);
         p->is_interpolated = true;
     }
     pass_draw_to_screen(p, fbo, flags);
+
+    // A motion shader rejected by the GPU would break every frame, so blend
+    // instead until the options change.
+    if (motion_tried && !had_error && (!motion || gl_sc_error_state(p->sc))) {
+        MP_ERR(p, "Motion interpolation failed, blending frames instead.\n");
+        gl_sc_reset_error(p->sc);
+        p->motion_disabled = true;
+    }
 
     p->frames_drawn += 1;
 }
@@ -4188,6 +4579,13 @@ static void check_gl_features(struct gl_video *p)
         p->opts.deband = false;
         MP_WARN(p, "Disabling debanding (GLSL version too old).\n");
     }
+    if (p->opts.interpolation_mode == INTERPOLATION_MOTION &&
+        (!have_mglsl || p->fbo_format->ctype != RA_CTYPE_FLOAT))
+    {
+        p->opts.interpolation_mode = INTERPOLATION_BLEND;
+        MP_WARN(p, "Disabling motion interpolation (needs GLSL 130 and a "
+                   "floating point FBO format).\n");
+    }
 }
 
 static void init_gl(struct gl_video *p)
@@ -4386,7 +4784,7 @@ void gl_video_configure_queue(struct gl_video *p, struct vo *vo)
     if (p->opts.interpolation) {
         const struct filter_kernel *kernel =
             mp_find_filter_kernel(p->opts.scaler[SCALER_TSCALE].kernel.function);
-        if (kernel) {
+        if (kernel && p->opts.interpolation_mode != INTERPOLATION_MOTION) {
             // filter_scale wouldn't be correctly initialized were we to use it here.
             // This is fine since we're always upsampling, but beware if downsampling
             // is added!
@@ -4394,7 +4792,7 @@ void gl_video_configure_queue(struct gl_video *p, struct vo *vo)
             radius = radius > 0 ? radius : p->opts.scaler[SCALER_TSCALE].radius;
             queue_size += 1 + ceil(radius);
         } else {
-            // Oversample/linear case
+            // Oversample/linear/motion case
             queue_size += 2;
         }
     }

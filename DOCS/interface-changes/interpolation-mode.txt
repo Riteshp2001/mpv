@@ -1,0 +1,1 @@
+add `--interpolation-mode` to render motion compensated frames with `--vo=gpu`

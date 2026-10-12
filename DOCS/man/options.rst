@@ -6216,6 +6216,22 @@ them.
 
     Set this to ``-1`` to disable this logic.
 
+``--interpolation-mode=<blend|motion>``
+    Select how ``--interpolation`` generates intermediate frames.
+
+    :blend:  Convolve neighbouring frames along the temporal axis with the
+             ``--tscale`` filter (default).
+    :motion: Estimate the motion between each pair of frames and render
+             motion compensated frames at the display refresh rate, which
+             makes the video look like it was recorded at that rate. Areas
+             where motion cannot be tracked are blended instead, and scene
+             changes are not interpolated. ``--tscale`` is ignored.
+
+    ``motion`` costs considerably more GPU time than ``blend``, needs a
+    floating point ``--fbo-format``, and is only supported by ``--vo=gpu``.
+    Subtitles rendered into the video with ``--blend-subtitles`` are warped
+    along with it.
+
 ``--interpolation-preserve``
     Preserve the previous frames' interpolated results even when renderer
     parameters are changed - with the exception of options related to

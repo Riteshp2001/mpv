@@ -114,6 +114,11 @@ enum gamut_mode {
     GAMUT_LINEAR,
 };
 
+enum interpolation_mode {
+    INTERPOLATION_BLEND,
+    INTERPOLATION_MOTION,
+};
+
 struct gl_tone_map_opts {
     int curve;
     float curve_param;
@@ -166,6 +171,7 @@ struct gl_video_opts {
     int background_tile_size;
     bool interpolation;
     float interpolation_threshold;
+    int interpolation_mode;
     int blend_subs;
     char **user_shaders;
     char **user_shader_opts;
